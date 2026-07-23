@@ -1,0 +1,447 @@
+import os
+import json
+import time
+import hashlib
+import psycopg2
+import psycopg2.extras
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
+from playwright.sync_api import sync_playwright
+from functools import wraps
+import secrets
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+DEEPSEEK_SESSION_ID = "eac394942672455abc38d9afbe989c1b"
+DB_URL = "postgresql://bothost_db_06a851292493:ToKKxst8x1doT6bVcHgfjr7AV8czk0jGA86XlKI0zyo@node1.pghost.ru:15918/bothost_db_06a851292493"
+
+def get_db_connection():
+    return psycopg2.connect(DB_URL)
+
+def init_db():
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(255) UNIQUE NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id),
+                    title VARCHAR(255) DEFAULT 'New Chat',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    conversation_id INTEGER REFERENCES conversations(id),
+                    role VARCHAR(50) NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+        conn.commit()
+
+class DeepSeekBrowser:
+    def __init__(self):
+        self.session_id = DEEPSEEK_SESSION_ID
+        self.headless = os.environ.get('HEADLESS', 'true').lower() == 'true'
+        
+        self.cookies = [
+            {
+                "name": "dc_session_id",
+                "value": self.session_id,
+                "domain": ".deepseek.com",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax"
+            }
+        ]
+    
+    def _setup_stealth(self, page):
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+        """)
+        
+        page.set_extra_http_headers({
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"'
+        })
+    
+    def send_message(self, message):
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=self.headless,
+                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled']
+            )
+            
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            
+            context.add_cookies(self.cookies)
+            page = context.new_page()
+            self._setup_stealth(page)
+            
+            try:
+                page.goto('https://chat.deepseek.com/', wait_until='networkidle', timeout=30000)
+                time.sleep(3)
+                
+                input_element = page.locator('textarea').first
+                input_element.click()
+                input_element.fill(message)
+                page.keyboard.press('Enter')
+                
+                time.sleep(8)
+                
+                messages = page.locator('div[class*="message"]').all()
+                if messages:
+                    return messages[-1].inner_text()
+                return "Нет ответа"
+                
+            except Exception as e:
+                return f"Ошибка: {str(e)}"
+            finally:
+                browser.close()
+
+deepseek = DeepSeekBrowser()
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+LOGIN_HTML = '''
+<!DOCTYPE html>
+<html>
+<head><title>Login</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Arial;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;align-items:center;justify-content:center}
+.container{background:#fff;padding:30px;border-radius:10px;width:350px}
+h1{text-align:center;margin-bottom:20px}
+input{width:100%;padding:10px;margin:10px 0;border:1px solid #ddd;border-radius:5px}
+button{width:100%;padding:10px;background:#667eea;color:#fff;border:none;border-radius:5px;cursor:pointer}
+.error{color:red;text-align:center}
+.link{text-align:center;margin-top:15px}
+a{color:#667eea}
+</style></head>
+<body>
+<div class="container">
+<h1>DeepSeek Chat</h1>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+<form method="POST">
+<input type="text" name="username" placeholder="Логин" required>
+<input type="password" name="password" placeholder="Пароль" required>
+<button type="submit">Войти</button>
+</form>
+<div class="link"><a href="/register">Регистрация</a></div>
+</div></body></html>
+'''
+
+REGISTER_HTML = '''
+<!DOCTYPE html>
+<html>
+<head><title>Register</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Arial;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;align-items:center;justify-content:center}
+.container{background:#fff;padding:30px;border-radius:10px;width:350px}
+h1{text-align:center;margin-bottom:20px}
+input{width:100%;padding:10px;margin:10px 0;border:1px solid #ddd;border-radius:5px}
+button{width:100%;padding:10px;background:#667eea;color:#fff;border:none;border-radius:5px;cursor:pointer}
+.error{color:red;text-align:center}
+.link{text-align:center;margin-top:15px}
+a{color:#667eea}
+</style></head>
+<body>
+<div class="container">
+<h1>Регистрация</h1>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+<form method="POST">
+<input type="text" name="username" placeholder="Логин" required>
+<input type="password" name="password" placeholder="Пароль" required>
+<button type="submit">Зарегистрироваться</button>
+</form>
+<div class="link"><a href="/login">Войти</a></div>
+</div></body></html>
+'''
+
+CHAT_HTML = '''
+<!DOCTYPE html>
+<html>
+<head><title>Chat</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Arial;height:100vh;display:flex}
+.sidebar{width:280px;background:#1a1a2e;color:#fff;display:flex;flex-direction:column}
+.sidebar-header{padding:20px;border-bottom:1px solid #333}
+.new-chat-btn{width:100%;padding:12px;background:#667eea;color:#fff;border:none;border-radius:8px;cursor:pointer}
+.conversations-list{flex:1;overflow-y:auto;padding:10px}
+.conversation-item{padding:12px;margin-bottom:5px;border-radius:8px;cursor:pointer;font-size:14px}
+.conversation-item:hover,.conversation-item.active{background:#2a2a4e}
+.main-chat{flex:1;display:flex;flex-direction:column;background:#f5f5f5}
+.chat-header{padding:20px;background:#fff;border-bottom:1px solid #e0e0e0;display:flex;justify-content:space-between;align-items:center}
+.logout-btn{padding:8px 16px;background:#e74c3c;color:#fff;border:none;border-radius:5px;cursor:pointer}
+.messages-container{flex:1;overflow-y:auto;padding:20px}
+.message{margin-bottom:20px;display:flex}
+.message.user{justify-content:flex-end}
+.message-content{max-width:70%;padding:12px 16px;border-radius:12px;font-size:14px;line-height:1.5}
+.user .message-content{background:#667eea;color:#fff}
+.assistant .message-content{background:#fff;color:#333}
+.input-container{padding:20px;background:#fff;border-top:1px solid #e0e0e0}
+.input-wrapper{display:flex;gap:10px}
+#messageInput{flex:1;padding:12px;border:1px solid #ddd;border-radius:8px;font-size:14px}
+#sendButton{padding:12px 24px;background:#667eea;color:#fff;border:none;border-radius:8px;cursor:pointer}
+</style></head>
+<body>
+<div class="sidebar">
+<div class="sidebar-header"><button class="new-chat-btn" onclick="newChat()">+ Новый чат</button></div>
+<div class="conversations-list" id="conversationsList"></div>
+</div>
+<div class="main-chat">
+<div class="chat-header">
+<h3 id="chatTitle">{{ username }}</h3>
+<button class="logout-btn" onclick="logout()">Выйти</button>
+</div>
+<div class="messages-container" id="messagesContainer">
+<div style="text-align:center;color:#999;margin-top:50px">Выберите чат или начните новый</div>
+</div>
+<div class="input-container">
+<div class="input-wrapper">
+<input type="text" id="messageInput" placeholder="Введите сообщение..." onkeypress="if(event.key==='Enter')sendMessage()">
+<button id="sendButton" onclick="sendMessage()">Отправить</button>
+</div>
+</div>
+</div>
+<script>
+let currentConversationId = null;
+
+async function loadConversations() {
+    const response = await fetch('/api/conversations');
+    const conversations = await response.json();
+    const list = document.getElementById('conversationsList');
+    list.innerHTML = conversations.map(c => 
+        `<div class="conversation-item" onclick="loadConversation(${c.id})">${c.title}</div>`
+    ).join('');
+}
+
+async function newChat() {
+    currentConversationId = null;
+    document.getElementById('messagesContainer').innerHTML = 
+        '<div style="text-align:center;color:#999;margin-top:50px">Новый чат</div>';
+    document.getElementById('messageInput').focus();
+}
+
+async function loadConversation(id) {
+    currentConversationId = id;
+    const response = await fetch(`/api/conversations/${id}/messages`);
+    const messages = await response.json();
+    const container = document.getElementById('messagesContainer');
+    container.innerHTML = messages.map(m => 
+        `<div class="message ${m.role}"><div class="message-content">${m.content}</div></div>`
+    ).join('');
+    container.scrollTop = container.scrollHeight;
+}
+
+async function sendMessage() {
+    const input = document.getElementById('messageInput');
+    const message = input.value.trim();
+    if(!message) return;
+    
+    input.value = '';
+    input.disabled = true;
+    document.getElementById('sendButton').disabled = true;
+    
+    const container = document.getElementById('messagesContainer');
+    container.innerHTML += `<div class="message user"><div class="message-content">${message}</div></div>`;
+    container.innerHTML += '<div class="message assistant"><div class="message-content">Думаю...</div></div>';
+    container.scrollTop = container.scrollHeight;
+    
+    const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({message, conversation_id: currentConversationId})
+    });
+    
+    const data = await response.json();
+    currentConversationId = data.conversation_id;
+    
+    const messages = container.getElementsByClassName('message');
+    const lastMessage = messages[messages.length - 1];
+    lastMessage.querySelector('.message-content').textContent = data.assistant_message;
+    
+    loadConversations();
+    input.disabled = false;
+    document.getElementById('sendButton').disabled = false;
+    input.focus();
+}
+
+function logout() {
+    window.location.href = '/logout';
+}
+
+loadConversations();
+</script>
+</body></html>
+'''
+
+@app.route('/')
+def index():
+    if 'user_id' in session:
+        return redirect(url_for('chat'))
+    return redirect(url_for('login'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM users WHERE username = %s AND password_hash = %s",
+                    (username, hashlib.sha256(password.encode()).hexdigest())
+                )
+                user = cur.fetchone()
+                if user:
+                    session['user_id'] = user['id']
+                    session['username'] = user['username']
+                    return redirect(url_for('chat'))
+        
+        return render_template_string(LOGIN_HTML, error='Неверные данные')
+    return render_template_string(LOGIN_HTML)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        if not username or not password:
+            return render_template_string(REGISTER_HTML, error='Заполните все поля')
+        
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO users (username, password_hash) VALUES (%s, %s) RETURNING id",
+                        (username, hashlib.sha256(password.encode()).hexdigest())
+                    )
+                    user_id = cur.fetchone()[0]
+                conn.commit()
+            
+            session['user_id'] = user_id
+            session['username'] = username
+            return redirect(url_for('chat'))
+        except psycopg2.errors.UniqueViolation:
+            return render_template_string(REGISTER_HTML, error='Логин занят')
+    
+    return render_template_string(REGISTER_HTML)
+
+@app.route('/chat')
+@login_required
+def chat():
+    return render_template_string(CHAT_HTML, username=session.get('username'))
+
+@app.route('/api/conversations', methods=['GET'])
+@login_required
+def get_conversations():
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM conversations WHERE user_id = %s ORDER BY updated_at DESC",
+                (session['user_id'],)
+            )
+            return jsonify([dict(c) for c in cur.fetchall()])
+
+@app.route('/api/conversations/<int:conv_id>/messages', methods=['GET'])
+@login_required
+def get_messages(conv_id):
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM messages WHERE conversation_id = %s ORDER BY created_at",
+                (conv_id,)
+            )
+            return jsonify([dict(m) for m in cur.fetchall()])
+
+@app.route('/api/chat', methods=['POST'])
+@login_required
+def send_message():
+    data = request.json
+    message = data.get('message')
+    conversation_id = data.get('conversation_id')
+    
+    if not message:
+        return jsonify({'error': 'Message is required'}), 400
+    
+    if not conversation_id:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    "INSERT INTO conversations (user_id, title) VALUES (%s, %s) RETURNING *",
+                    (session['user_id'], message[:50] + '...')
+                )
+                conversation = cur.fetchone()
+            conn.commit()
+        conversation_id = conversation['id']
+    
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (conversation_id, role, content) VALUES (%s, %s, %s)",
+                (conversation_id, 'user', message)
+            )
+        conn.commit()
+    
+    response = deepseek.send_message(message)
+    
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (conversation_id, role, content) VALUES (%s, %s, %s)",
+                (conversation_id, 'assistant', response)
+            )
+            cur.execute(
+                "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (conversation_id,)
+            )
+        conn.commit()
+    
+    return jsonify({
+        'conversation_id': conversation_id,
+        'assistant_message': response
+    })
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+if __name__ == '__main__':
+    init_db()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
