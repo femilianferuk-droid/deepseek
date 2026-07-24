@@ -86,15 +86,15 @@ MAX_FILE_CHARS_IN_CONTEXT = 60_000
 
 # ============== AI Client ==============
 AI_CLIENT = Anthropic(
-    base_url=os.environ.get('ANTHROPIC_BASE_URL', 'https://api.smartapi.shop'),
-    api_key=os.environ.get('ANTHROPIC_API_KEY', 'sk-smart-3XD55m5XyNjpez1edNzGkuaqvnnXs6qKm1pf5hQqHEA'),
+    base_url=os.environ.get('ANTHROPIC_BASE_URL', 'https://tooken.club'),
+    api_key=os.environ.get('ANTHROPIC_API_KEY', 'tc_live_bb89f41380c52fa175884f8fe487576a7f4c5682e81cecb9'),
     timeout=60.0,
 )
 
 MODELS = [
-    ("sonnet-4.6",       "Sonnet 4.6"),
+    ("claude-opus-4-8",       "opus 4.8"),
     ("deepseek-v4-flash","DeepSeek V4 Flash"),
-    ("mimo-v2.5",        "Mimo V2.5"),
+    ("gpt-5.6-sol",        "GPT 5.6 SOL"),
     ("minimax-m3",       "MiniMax M3"),
 ]
 MODEL_IDS = {key: key for key, _ in MODELS}
